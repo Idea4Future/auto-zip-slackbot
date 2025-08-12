@@ -10,6 +10,7 @@ import shutil
 import datetime as dt
 from typing import List, Optional, Tuple
 import threading  # 전역 락 사용
+import time       # 진행 시간 측정
 
 import pytz
 import requests
@@ -115,6 +116,11 @@ def db_all_jobs():
 # 업로드(사전 서명 URL + 스트리밍)
 # ===============================
 def upload_zip_to_slack(channel_id: str, zip_path: str, base_title: str, thread_ts: Optional[str] = None):
+    """
+    - files_getUploadURLExternal → 업로드 URL 획득
+    - requests.post(..., data=fp) 로 스트리밍 전송(메모리 절약)
+    - files_completeUploadExternal 로 최종 완료
+    """
     size = os.path.getsize(zip_path)
     r = client.files_getUploadURLExternal(filename=os.path.basename(zip_path), length=size)
     upload_url = r["upload_url"]
@@ -140,6 +146,9 @@ def upload_zip_to_slack(channel_id: str, zip_path: str, base_title: str, thread_
 # 스레드 파일 수집
 # ===============================
 def fetch_thread_files(channel_id: str, thread_ts: str) -> List[dict]:
+    """
+    스레드 전체 메시지를 순회하며 files를 모아 Slack file 객체 리스트를 반환
+    """
     files = []
     cursor = None
     while True:
@@ -159,6 +168,11 @@ def fetch_thread_files(channel_id: str, thread_ts: str) -> List[dict]:
 # 다운로드 + 분할 ZIP 만들기
 # ===============================
 def download_and_make_zip_parts(files: List[dict], base_name: str) -> Tuple[List[str], Optional[str]]:
+    """
+    - 스레드의 파일들을 모두 다운로드(스트리밍) → 임시 폴더에 저장
+    - 900MB 기준으로 분할 ZIP 생성 (base_name_partN.zip)
+    - 반환: (zip_paths, tmp_root)
+    """
     if not files:
         return [], None
 
@@ -171,9 +185,11 @@ def download_and_make_zip_parts(files: List[dict], base_name: str) -> Tuple[List
             url = f.get("url_private_download") or f.get("url_private")
             if not url:
                 continue
+            # 파일명 sanitize
             name = (f.get("name") or f.get("title") or f.get("id")).replace("/", "_").replace("\\", "_")
             local_path = os.path.join(tmp_root, name)
 
+            # 스트리밍 다운로드
             with requests.get(url, headers=headers, stream=True, timeout=180) as r:
                 r.raise_for_status()
                 with open(local_path, "wb") as out:
@@ -205,8 +221,8 @@ def download_and_make_zip_parts(files: List[dict], base_name: str) -> Tuple[List
 
         for p in local_paths:
             sz = os.path.getsize(p)
-            # 단일 파일이 기준을 넘으면 그 파일만 단독 ZIP (분할 X)
             if sz >= MAX_ZIP_SIZE:
+                # 단일 대용량 파일은 단독 파트로
                 flush()
                 single_zip = os.path.join(tmp_root, f"{base_name}_part{part}.zip")
                 with zipfile.ZipFile(single_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
@@ -215,13 +231,12 @@ def download_and_make_zip_parts(files: List[dict], base_name: str) -> Tuple[List
                 part += 1
                 continue
 
-            # 그룹에 추가 시 기준 초과면 먼저 flush
+        # 현재 그룹에 차례대로 채우기
             if group_size + sz > MAX_ZIP_SIZE:
                 flush()
             group.append(p)
             group_size += sz
 
-        # 마지막 그룹 flush
         flush()
         return zip_paths, tmp_root
 
@@ -318,7 +333,7 @@ def debug_schedules():
     return jsonify(out)
 
 # ===============================
-# /cron/run : 유예창 고려 실행 (+ 전역 락)
+# /cron/run : 유예창 고려 실행 (+ 전역 락) + "압축 중" & "완료" 댓글
 # ===============================
 def run_due_jobs(max_batch: int = 50):
     now_utc = int(dt.datetime.now(tz=dt.timezone.utc).timestamp())
@@ -326,8 +341,10 @@ def run_due_jobs(max_batch: int = 50):
     executed = 0
 
     for (channel_id, thread_ts, run_at_utc, title_clean) in jobs:
+        start_ts = time.monotonic()
+        started_msg_ts: Optional[str] = None
         try:
-            # 파일명 base (루트 메시지 텍스트 재확인)
+            # 파일명 base (루트 메시지 텍스트 우선, 없으면 DB title 사용)
             try:
                 parent = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=1)
                 if parent.get("messages"):
@@ -346,6 +363,18 @@ def run_due_jobs(max_batch: int = 50):
                 db_delete_schedule(channel_id, thread_ts)
                 continue
 
+            # ⏳ 시작 안내 (압축 중)
+            try:
+                total_files = len(files)
+                started = client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=f"⏳ 압축/업로드를 시작했습니다. (파일 {total_files}개, 파트당 최대 900MB)"
+                )
+                started_msg_ts = started.get("ts")
+            except Exception:
+                pass  # 안내 실패해도 본 작업은 계속
+
             # 분할 ZIP 생성
             zip_paths, tmp_root = download_and_make_zip_parts(files, base_title)
             if not zip_paths:
@@ -356,32 +385,40 @@ def run_due_jobs(max_batch: int = 50):
                     shutil.rmtree(tmp_root, ignore_errors=True)
                 continue
 
-            # 업로드
-            for zp in zip_paths:
+            # 업로드 (여러 파트 순차 업로드)
+            for idx, zp in enumerate(zip_paths, start=1):
                 upload_zip_to_slack(channel_id, zp, base_title, thread_ts=thread_ts)
 
+            # 임시 폴더 정리 + 예약 삭제
             if tmp_root:
-                shutil_rmtree_silent(tmp_root)
-
-            # 예약 삭제
+                shutil.rmtree(tmp_root, ignore_errors=True)
             db_delete_schedule(channel_id, thread_ts)
+
+            # ✅ 완료 안내
+            try:
+                elapsed = int(time.monotonic() - start_ts)
+                part_count = len(zip_paths)
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=f"✅ 완료: {part_count}개 파트 업로드 ({elapsed}초 소요)"
+                )
+            except Exception:
+                pass
+
             executed += 1
 
         except Exception as e:
+            # 실패 안내
             try:
                 client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                        text=f"(자동) ZIP 생성/업로드 오류: `{e}`")
+                                        text=f"❌ 오류: ZIP 생성/업로드 중 문제 발생 → `{e}`")
             except Exception:
                 pass
             # 실패한 예약은 남겨두고 다음 호출 때 재시도
+            # (원하면 여기서도 예약 삭제/유지 정책을 바꿀 수 있음)
 
     return executed
-
-def shutil_rmtree_silent(path: str):
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
 
 @flask_app.post("/cron/run")
 def cron_run():
@@ -395,7 +432,7 @@ def cron_run():
 
     # 동시 실행 방지: non-blocking으로 락 획득 시도
     if not CRON_LOCK.acquire(blocking=False):
-        # 이미 실행 중이면 스킵 (429 Too Many Requests)
+        # 이미 실행 중이면 스킵 (429 Too Many Requests) — 필요 시 200으로 바꿔도 됨
         return jsonify({"executed": 0, "skipped": "running"}), 429
 
     try:
@@ -416,9 +453,11 @@ def on_message_events(body, event, logger):
         thread_ts = event.get("thread_ts")
         is_root = (not thread_ts) or (thread_ts == ts)
 
+        # 봇 메시지/삭제는 무시
         if subtype in ("bot_message", "message_deleted"):
             return
 
+        # 메시지 수정
         if subtype == "message_changed":
             msg = event.get("message", {})
             ts2 = msg.get("ts")
@@ -431,6 +470,7 @@ def on_message_events(body, event, logger):
             upsert_or_cancel_schedule_by_title(channel_id, root_ts, new_text)
             return
 
+        # 새 루트 메시지
         if subtype is None and is_root:
             text = event.get("text") or ""
             root_ts = ts
@@ -447,4 +487,5 @@ def on_start():
 if __name__ == "__main__":
     on_start()
     port = int(os.environ.get("PORT", "8000"))
+    # Render Web Service: 0.0.0.0 바인딩 필수
     flask_app.run(host="0.0.0.0", port=port)
