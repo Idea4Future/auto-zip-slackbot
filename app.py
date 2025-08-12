@@ -9,6 +9,7 @@ import zipfile
 import shutil
 import datetime as dt
 from typing import List, Optional, Tuple
+import threading  # 전역 락 사용
 
 import pytz
 import requests
@@ -49,6 +50,9 @@ client: WebClient = bolt_app.client
 
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(bolt_app)
+
+# 전역 락: /cron/run 동시 실행 방지
+CRON_LOCK = threading.Lock()
 
 # ===============================
 # DB (SQLite)
@@ -119,7 +123,7 @@ def upload_zip_to_slack(channel_id: str, zip_path: str, base_title: str, thread_
     with open(zip_path, "rb") as fp:
         up = requests.post(
             upload_url,
-            data=fp,
+            data=fp,  # 파일 스트림 그대로 전송 (메모리 절약)
             headers={"Content-Type": "application/octet-stream"},
             timeout=900
         )
@@ -201,6 +205,7 @@ def download_and_make_zip_parts(files: List[dict], base_name: str) -> Tuple[List
 
         for p in local_paths:
             sz = os.path.getsize(p)
+            # 단일 파일이 기준을 넘으면 그 파일만 단독 ZIP (분할 X)
             if sz >= MAX_ZIP_SIZE:
                 flush()
                 single_zip = os.path.join(tmp_root, f"{base_name}_part{part}.zip")
@@ -210,11 +215,13 @@ def download_and_make_zip_parts(files: List[dict], base_name: str) -> Tuple[List
                 part += 1
                 continue
 
+            # 그룹에 추가 시 기준 초과면 먼저 flush
             if group_size + sz > MAX_ZIP_SIZE:
                 flush()
             group.append(p)
             group_size += sz
 
+        # 마지막 그룹 flush
         flush()
         return zip_paths, tmp_root
 
@@ -311,7 +318,7 @@ def debug_schedules():
     return jsonify(out)
 
 # ===============================
-# /cron/run : 유예창 고려 실행
+# /cron/run : 유예창 고려 실행 (+ 전역 락)
 # ===============================
 def run_due_jobs(max_batch: int = 50):
     now_utc = int(dt.datetime.now(tz=dt.timezone.utc).timestamp())
@@ -320,7 +327,7 @@ def run_due_jobs(max_batch: int = 50):
 
     for (channel_id, thread_ts, run_at_utc, title_clean) in jobs:
         try:
-            # 파일명 base
+            # 파일명 base (루트 메시지 텍스트 재확인)
             try:
                 parent = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=1)
                 if parent.get("messages"):
@@ -354,7 +361,7 @@ def run_due_jobs(max_batch: int = 50):
                 upload_zip_to_slack(channel_id, zp, base_title, thread_ts=thread_ts)
 
             if tmp_root:
-                shutil.rmtree(tmp_root, ignore_errors=True)
+                shutil_rmtree_silent(tmp_root)
 
             # 예약 삭제
             db_delete_schedule(channel_id, thread_ts)
@@ -370,16 +377,32 @@ def run_due_jobs(max_batch: int = 50):
 
     return executed
 
+def shutil_rmtree_silent(path: str):
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
 @flask_app.post("/cron/run")
 def cron_run():
+    # 인증
     auth = request.headers.get("Authorization", "")
     if not CRON_PING_TOKEN or not auth.startswith("Bearer "):
         return Response("Unauthorized", status=401)
     token = auth.split(" ", 1)[1].strip()
     if token != CRON_PING_TOKEN:
         return Response("Forbidden", status=403)
-    executed = run_due_jobs(max_batch=50)
-    return jsonify({"executed": executed})
+
+    # 동시 실행 방지: non-blocking으로 락 획득 시도
+    if not CRON_LOCK.acquire(blocking=False):
+        # 이미 실행 중이면 스킵 (429 Too Many Requests)
+        return jsonify({"executed": 0, "skipped": "running"}), 429
+
+    try:
+        executed = run_due_jobs(max_batch=50)
+        return jsonify({"executed": executed})
+    finally:
+        CRON_LOCK.release()
 
 # ===============================
 # Slack 이벤트 핸들러 (루트 메시지 생성/수정)
