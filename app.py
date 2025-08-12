@@ -9,7 +9,7 @@ import zipfile
 import shutil
 import datetime as dt
 from typing import List, Optional, Tuple
-import threading  # 전역 락 사용
+import threading
 
 import pytz
 import requests
@@ -112,6 +112,15 @@ def db_all_jobs():
         return cur.fetchall()
 
 # ===============================
+# 유틸: 안내 메시지(실패 무시)
+# ===============================
+def safe_post(channel_id: str, thread_ts: str, text: str):
+    try:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=text)
+    except Exception:
+        pass
+
+# ===============================
 # 업로드(사전 서명 URL + 스트리밍)
 # ===============================
 def upload_zip_to_slack(channel_id: str, zip_path: str, base_title: str, thread_ts: Optional[str] = None):
@@ -123,7 +132,7 @@ def upload_zip_to_slack(channel_id: str, zip_path: str, base_title: str, thread_
     with open(zip_path, "rb") as fp:
         up = requests.post(
             upload_url,
-            data=fp,
+            data=fp,                             # 스트리밍 업로드 (메모리 절약)
             headers={"Content-Type": "application/octet-stream"},
             timeout=900
         )
@@ -141,10 +150,9 @@ def upload_zip_to_slack(channel_id: str, zip_path: str, base_title: str, thread_
 # ===============================
 def fetch_thread_files(channel_id: str, thread_ts: str) -> List[dict]:
     """
-    - 예약 시각 '당시' 스레드에 존재하는 파일만 수집
-    - 삭제되었거나(mode=tombstone), 다운로드 URL이 없는 항목은 스킵
-    - files.info 호출을 하지 않음(삭제된 파일로 인한 오류 방지)
-    반환 객체는 요청/다운로드에 필요한 최소 필드만 포함
+    - 예약 시각 당시 스레드에 존재하는 파일만 수집
+    - 삭제(tombstone)/URL 없음 항목 스킵
+    - files.info 호출 안 함(삭제 파일 오류 방지)
     """
     files: List[dict] = []
     cursor = None
@@ -152,13 +160,11 @@ def fetch_thread_files(channel_id: str, thread_ts: str) -> List[dict]:
         resp = client.conversations_replies(channel=channel_id, ts=thread_ts, cursor=cursor, limit=200)
         for m in resp.get("messages", []):
             for fobj in (m.get("files") or []):
-                # 삭제/무효 파일 스킵
                 if fobj.get("is_deleted") or fobj.get("mode") == "tombstone":
                     continue
                 url = fobj.get("url_private_download") or fobj.get("url_private")
                 if not url:
                     continue
-                # 필요한 최소 필드만 복사
                 files.append({
                     "id": fobj.get("id"),
                     "name": fobj.get("name"),
@@ -274,21 +280,13 @@ def upsert_or_cancel_schedule_by_title(channel_id: str, root_ts: str, text: str)
     when_local = parse_when_from_title(text)
     if not when_local:
         db_delete_schedule(channel_id, root_ts)
-        try:
-            client.chat_postMessage(channel=channel_id, thread_ts=root_ts,
-                                    text="(자동) 날짜/시간을 찾지 못해 예약을 취소했습니다.")
-        except Exception:
-            pass
+        safe_post(channel_id, root_ts, "(자동) 날짜/시간을 찾지 못해 예약을 취소했습니다.")
         return
 
     now_local = dt.datetime.now(TZ)
     if when_local <= now_local:
         db_delete_schedule(channel_id, root_ts)
-        try:
-            client.chat_postMessage(channel=channel_id, thread_ts=root_ts,
-                                    text=f"(자동) 과거 시각({when_local.strftime('%Y-%m-%d %H:%M')})이라 예약을 취소했습니다.")
-        except Exception:
-            pass
+        safe_post(channel_id, root_ts, f"(자동) 과거 시각({when_local.strftime('%Y-%m-%d %H:%M')})이라 예약을 취소했습니다.")
         return
 
     title_clean = re.sub(r'[\\/:*?"<>|]+', "_", (text or "")).strip() or f"thread_{root_ts}"
@@ -296,14 +294,7 @@ def upsert_or_cancel_schedule_by_title(channel_id: str, root_ts: str, text: str)
     db_upsert_schedule(channel_id, root_ts, run_at_utc, title_clean)
 
     # 확인 메시지
-    try:
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=root_ts,
-            text=f"📅 예약됨: {when_local.strftime('%Y-%m-%d %H:%M')} (유예창 {WINDOW_SEC}s)"
-        )
-    except Exception:
-        pass
+    safe_post(channel_id, root_ts, f"📅 예약됨: {when_local.strftime('%Y-%m-%d %H:%M')} (유예창 {WINDOW_SEC}s)")
 
 # ===============================
 # Flask 라우트
@@ -322,7 +313,6 @@ def healthz():
 
 @flask_app.get("/debug/schedules")
 def debug_schedules():
-    # 간단한 확인용(보안상 필요시 삭제/보호)
     rows = db_all_jobs()
     out = []
     for ch, ts, run_at_utc, title in rows:
@@ -356,17 +346,19 @@ def run_due_jobs(max_batch: int = 50):
 
             # 파일 수집 (현재 남아있는 파일만)
             files = fetch_thread_files(channel_id, thread_ts)
-            if not files:
-                client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                        text="(자동) 스레드에 파일이 없어 ZIP을 건너뜁니다.")
+            total_files = len(files)
+            if total_files == 0:
+                safe_post(channel_id, thread_ts, "(자동) 스레드에 파일이 없어 ZIP을 건너뜁니다.")
                 db_delete_schedule(channel_id, thread_ts)
                 continue
+
+            # 안내 1: 압축 시작
+            safe_post(channel_id, thread_ts, f"📦 압축 시작: 파일 {total_files}개")
 
             # 분할 ZIP 생성
             zip_paths, tmp_root = download_and_make_zip_parts(files, base_title)
             if not zip_paths:
-                client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                        text="(자동) ZIP 대상 파일이 없어 종료합니다.")
+                safe_post(channel_id, thread_ts, "(자동) ZIP 대상 파일이 없어 종료합니다.")
                 db_delete_schedule(channel_id, thread_ts)
                 if tmp_root:
                     shutil.rmtree(tmp_root, ignore_errors=True)
@@ -381,12 +373,16 @@ def run_due_jobs(max_batch: int = 50):
 
             # 예약 삭제
             db_delete_schedule(channel_id, thread_ts)
+
+            # 안내 2: 완료(총 part 개수)
+            parts = len(zip_paths)
+            safe_post(channel_id, thread_ts, f"🎉 완료: ZIP part {parts}개 업로드됨")
+
             executed += 1
 
         except Exception as e:
             try:
-                client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                        text=f"(자동) ZIP 생성/업로드 오류: `{e}`")
+                safe_post(channel_id, thread_ts, f"(자동) ZIP 생성/업로드 오류: `{e}`")
             except Exception:
                 pass
             # 실패한 예약은 남겨두고 다음 호출 때 재시도
